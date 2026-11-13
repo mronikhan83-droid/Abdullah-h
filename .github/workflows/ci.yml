@@ -114,6 +114,7 @@ jobs:
         if: steps.secrets_check.outputs.skip == 'false'
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
         run: |
           if ! supabase link --project-ref ${{ secrets.SUPABASE_PROJECT_REF }}; then
             echo "::warning::supabase link failed (token expired or project ref wrong). Rotate SUPABASE_ACCESS_TOKEN."
@@ -124,6 +125,7 @@ jobs:
         if: steps.secrets_check.outputs.skip == 'false'
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
         run: |
           if ! supabase db push --include-all; then
             echo "::warning::supabase db push failed. Inspect migrations and re-run manually."
@@ -180,7 +182,7 @@ jobs:
           SUPABASE_URL=${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
           APP_ENV=production
-          SHOW_DEMO_CREDENTIALS=true
+          SHOW_DEMO_CREDENTIALS=false
           SUPER_ADMIN_EMAIL=${{ secrets.SUPER_ADMIN_EMAIL }}
           EOF
           sed -i 's/^ *//' .env
@@ -191,7 +193,7 @@ jobs:
         # runtime. Browsers with strict shields (Brave, hardened Firefox,
         # uBlock-aggressive Chromium) block gstatic.com as a Google tracker;
         # without bundled CanvasKit those visitors see a blank page.
-        run: flutter build web --release --base-href /Flutter-school-management-/ --tree-shake-icons --no-web-resources-cdn
+        run: flutter build web --release --base-href /Abdullah-h/ --tree-shake-icons --no-web-resources-cdn
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
