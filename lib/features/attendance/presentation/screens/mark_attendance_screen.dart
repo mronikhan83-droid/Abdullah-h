@@ -1,0 +1,676 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../../../core/copy/warm_strings.dart';
+import '../../../../core/providers/connectivity_provider.dart';
+import '../../../../core/theme/app_colors.dart';
+import '../../../../core/widgets/undo_banner.dart';
+import '../../../../shared/extensions/context_extensions.dart';
+import '../../../../data/models/attendance.dart';
+import '../../../attendance/providers/attendance_provider.dart';
+import '../../../students/providers/students_provider.dart';
+
+class MarkAttendanceScreen extends ConsumerStatefulWidget {
+  final String sectionId;
+  final String? date;
+
+  const MarkAttendanceScreen({
+    super.key,
+    required this.sectionId,
+    this.date,
+  });
+
+  @override
+  ConsumerState<MarkAttendanceScreen> createState() => _MarkAttendanceScreenState();
+}
+
+class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
+  late List<StudentAttendanceRecord> _students;
+  bool _isSubmitting = false;
+  bool _hasChanges = false;
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadStudents();
+  }
+
+  void _loadStudents() {
+    _fetchStudentsAndExistingAttendance();
+  }
+
+  Future<void> _fetchStudentsAndExistingAttendance() async {
+    setState(() {
+      _isLoading = true;
+      _students = [];
+      _hasChanges = false;
+    });
+
+    try {
+      final studentRepo = ref.read(studentRepositoryProvider);
+      final attendanceRepo = ref.read(attendanceRepositoryProvider);
+
+      final date = widget.date != null
+          ? DateTime.parse(widget.date!)
+          : DateTime.now();
+
+      // Load active students for this section from Supabase
+      final students = await studentRepo.getStudentsBySection(widget.sectionId);
+
+      // Load any existing attendance records for this date/section
+      final existing = await attendanceRepo.getAttendanceBySection(
+        sectionId: widget.sectionId,
+        date: date,
+      );
+
+      final existingByStudentId = {
+        for (final a in existing) a.studentId: a,
+      };
+
+      _students = students.map((s) {
+        final Attendance? a = existingByStudentId[s.id];
+        return StudentAttendanceRecord(
+          studentId: s.id,
+          studentName: s.fullName,
+          rollNumber: a?.studentRollNumber ?? s.rollNumber,
+          photoUrl: s.photoUrl,
+          status: a?.status ?? AttendanceStatus.present,
+          remarks: a?.remarks,
+        );
+      }).toList();
+
+      setState(() {
+        _isLoading = false;
+      });
+    } catch (_) {
+      if (mounted) {
+        context.showErrorSnackBar(WarmCopy.loadFailed('students'));
+      }
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  /// Snapshot the current roster as a wire payload so we can restore
+  /// byte-for-byte if the teacher hits Undo within the banner window.
+  List<Map<String, dynamic>> _snapshotPayload() {
+    return _students
+        .map((s) => <String, dynamic>{
+              'student_id': s.studentId,
+              'status': s.status.dbValue,
+              'remarks': s.remarks,
+            })
+        .toList(growable: false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isLoading) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Mark Attendance')),
+        body: const Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    final presentCount = _students.where((s) => s.status == AttendanceStatus.present).length;
+    final absentCount = _students.where((s) => s.status == AttendanceStatus.absent).length;
+    final lateCount = _students.where((s) => s.status == AttendanceStatus.late).length;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Mark Attendance'),
+        actions: [
+          TextButton(
+            onPressed: _markAllPresent,
+            child: const Text('All Present'),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // Offline Banner
+          Consumer(
+            builder: (context, ref, _) {
+              final isOnline = ref.watch(isOnlineProvider);
+              final pendingCount = ref.watch(pendingSyncCountProvider);
+              final online = isOnline.valueOrNull ?? true;
+              final pending = pendingCount.valueOrNull ?? 0;
+
+              if (online && pending == 0) return const SizedBox.shrink();
+
+              return Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                color: online ? AppColors.info : Colors.orange[700],
+                child: Row(
+                  children: [
+                    Icon(
+                      online ? Icons.sync : Icons.cloud_off,
+                      color: Colors.white,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        online
+                            ? 'Syncing $pending pending record${pending == 1 ? '' : 's'}...'
+                            : 'Offline — changes will sync when connected',
+                        style: const TextStyle(color: Colors.white, fontSize: 13),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+
+          // Summary Bar
+          Container(
+            padding: const EdgeInsets.all(16),
+            color: Theme.of(context).brightness == Brightness.dark
+                ? Colors.black12
+                : Colors.grey[100],
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                _SummaryChip(
+                  label: 'Present',
+                  count: presentCount,
+                  color: AppColors.success,
+                ),
+                _SummaryChip(
+                  label: 'Absent',
+                  count: absentCount,
+                  color: AppColors.error,
+                ),
+                _SummaryChip(
+                  label: 'Late',
+                  count: lateCount,
+                  color: AppColors.warning,
+                ),
+                _SummaryChip(
+                  label: 'Total',
+                  count: _students.length,
+                  color: AppColors.primary,
+                ),
+              ],
+            ),
+          ),
+
+          // Quick Actions
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _markAllPresent,
+                    icon: const Icon(Icons.check_circle_outline),
+                    label: const Text('All Present'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppColors.success,
+                      side: const BorderSide(color: AppColors.success),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _markAllAbsent,
+                    icon: const Icon(Icons.cancel_outlined),
+                    label: const Text('All Absent'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppColors.error,
+                      side: const BorderSide(color: AppColors.error),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // Student List
+          Expanded(
+            child: ListView.builder(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              itemCount: _students.length,
+              itemBuilder: (context, index) {
+                final student = _students[index];
+                return _StudentAttendanceCard(
+                  student: student,
+                  onStatusChanged: (status) {
+                    setState(() {
+                      student.status = status;
+                      _hasChanges = true;
+                    });
+                  },
+                  onRemarksChanged: (remarks) {
+                    student.remarks = remarks;
+                    _hasChanges = true;
+                  },
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton(
+        backgroundColor: AppColors.primary,
+        onPressed: () => context.push(
+          '/qr-scanner?mode=attendance&sectionId=${widget.sectionId}',
+        ),
+        child: const Icon(Icons.qr_code_scanner, color: Colors.white),
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: ElevatedButton(
+            onPressed: _hasChanges && !_isSubmitting ? _submitAttendance : null,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.primary,
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+            child: _isSubmitting
+                ? const SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      valueColor: AlwaysStoppedAnimation(Colors.white),
+                    ),
+                  )
+                : const Text(
+                    'Submit Attendance',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.white,
+                    ),
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _markAllPresent() {
+    setState(() {
+      for (final student in _students) {
+        student.status = AttendanceStatus.present;
+      }
+      _hasChanges = true;
+    });
+  }
+
+  void _markAllAbsent() {
+    setState(() {
+      for (final student in _students) {
+        student.status = AttendanceStatus.absent;
+      }
+      _hasChanges = true;
+    });
+  }
+
+  Future<void> _submitAttendance() async {
+    // Snapshot the prior server state so Undo can restore it byte-for-byte.
+    // Read BEFORE we overwrite; if the read fails the undo simply won't be
+    // offered (caller falls through to the normal save path).
+    List<Map<String, dynamic>>? priorPayload;
+    try {
+      final attendanceRepo = ref.read(attendanceRepositoryProvider);
+      final date = widget.date != null
+          ? DateTime.parse(widget.date!)
+          : DateTime.now();
+      final prior = await attendanceRepo.getAttendanceBySection(
+        sectionId: widget.sectionId,
+        date: date,
+      );
+      if (prior.isNotEmpty) {
+        priorPayload = prior
+            .map((a) => <String, dynamic>{
+                  'student_id': a.studentId,
+                  'status': a.status.dbValue,
+                  'remarks': a.remarks,
+                })
+            .toList(growable: false);
+      }
+    } catch (_) {
+      // Best-effort; undo just won't be offered.
+      priorPayload = null;
+    }
+
+    setState(() => _isSubmitting = true);
+
+    try {
+      final attendanceRepo = ref.read(attendanceRepositoryProvider);
+      final date = widget.date != null
+          ? DateTime.parse(widget.date!)
+          : DateTime.now();
+
+      final savedOnline = await attendanceRepo.markBulkAttendance(
+        sectionId: widget.sectionId,
+        date: date,
+        attendanceRecords: _snapshotPayload(),
+      );
+
+      if (!mounted) return;
+
+      if (priorPayload != null) {
+        // Existing records were overwritten — offer a 6s undo window.
+        UndoBanner.show(
+          context,
+          message: savedOnline
+              ? WarmCopy.undoBanner('Attendance')
+              : WarmCopy.savedOffline('Attendance'),
+          onUndo: () => _restoreAttendance(priorPayload!, date),
+        );
+      } else {
+        // First-time save — no prior state to restore, just confirm.
+        context.showSuccessSnackBar(
+          savedOnline
+              ? WarmCopy.undoBanner('Attendance')
+              : WarmCopy.savedOffline('Attendance'),
+        );
+      }
+
+      Navigator.pop(context);
+    } catch (_) {
+      if (mounted) {
+        context.showErrorSnackBar(WarmCopy.saveFailed('attendance'));
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isSubmitting = false);
+      }
+    }
+  }
+
+  Future<void> _restoreAttendance(
+    List<Map<String, dynamic>> priorPayload,
+    DateTime date,
+  ) async {
+    try {
+      final attendanceRepo = ref.read(attendanceRepositoryProvider);
+      await attendanceRepo.markBulkAttendance(
+        sectionId: widget.sectionId,
+        date: date,
+        attendanceRecords: priorPayload,
+      );
+      if (mounted) {
+        context.showSuccessSnackBar('Restored previous attendance.');
+      }
+    } catch (_) {
+      if (mounted) {
+        context.showErrorSnackBar(WarmCopy.saveFailed('the previous state'));
+      }
+    }
+  }
+}
+
+class _SummaryChip extends StatelessWidget {
+  final String label;
+  final int count;
+  final Color color;
+
+  const _SummaryChip({
+    required this.label,
+    required this.count,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.1),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Text(
+            '$count',
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+              color: color,
+            ),
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 12,
+            color: Colors.grey[600],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _StudentAttendanceCard extends StatelessWidget {
+  final StudentAttendanceRecord student;
+  final ValueChanged<AttendanceStatus> onStatusChanged;
+  final ValueChanged<String> onRemarksChanged;
+
+  const _StudentAttendanceCard({
+    required this.student,
+    required this.onStatusChanged,
+    required this.onRemarksChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+        side: BorderSide(
+          color: _getStatusColor(student.status).withValues(alpha: 0.3),
+          width: 1.5,
+        ),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                // Student Info
+                CircleAvatar(
+                  backgroundColor: AppColors.primary.withValues(alpha: 0.1),
+                  child: Text(
+                    student.studentName.substring(0, 1),
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: AppColors.primary,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        student.studentName,
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      Text(
+                        'Roll No: ${student.rollNumber}',
+                        style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                      ),
+                    ],
+                  ),
+                ),
+                // More Options
+                IconButton(
+                  icon: const Icon(Icons.more_vert, size: 20),
+                  tooltip: 'More options',
+                  onPressed: () => _showOptions(context),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            // Status Buttons
+            Row(
+              children: [
+                _StatusButton(
+                  label: 'Present',
+                  icon: Icons.check,
+                  color: AppColors.success,
+                  isSelected: student.status == AttendanceStatus.present,
+                  onTap: () => onStatusChanged(AttendanceStatus.present),
+                ),
+                const SizedBox(width: 8),
+                _StatusButton(
+                  label: 'Absent',
+                  icon: Icons.close,
+                  color: AppColors.error,
+                  isSelected: student.status == AttendanceStatus.absent,
+                  onTap: () => onStatusChanged(AttendanceStatus.absent),
+                ),
+                const SizedBox(width: 8),
+                _StatusButton(
+                  label: 'Late',
+                  icon: Icons.access_time,
+                  color: AppColors.warning,
+                  isSelected: student.status == AttendanceStatus.late,
+                  onTap: () => onStatusChanged(AttendanceStatus.late),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Color _getStatusColor(AttendanceStatus status) {
+    switch (status) {
+      case AttendanceStatus.present:
+        return AppColors.success;
+      case AttendanceStatus.absent:
+        return AppColors.error;
+      case AttendanceStatus.late:
+        return AppColors.warning;
+      default:
+        return Colors.grey;
+    }
+  }
+
+  void _showOptions(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) {
+        return Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                student.studentName,
+                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                decoration: const InputDecoration(
+                  labelText: 'Remarks (optional)',
+                  hintText: 'Add any notes...',
+                ),
+                maxLines: 2,
+                onChanged: onRemarksChanged,
+              ),
+              const SizedBox(height: 16),
+              ListTile(
+                leading: const Icon(Icons.event_busy, color: AppColors.info),
+                title: const Text('Mark as Excused'),
+                onTap: () {
+                  onStatusChanged(AttendanceStatus.excused);
+                  Navigator.pop(context);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.timelapse, color: AppColors.accent),
+                title: const Text('Mark as Half Day'),
+                onTap: () {
+                  onStatusChanged(AttendanceStatus.halfDay);
+                  Navigator.pop(context);
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _StatusButton extends StatelessWidget {
+  final String label;
+  final IconData icon;
+  final Color color;
+  final bool isSelected;
+  final VoidCallback onTap;
+
+  const _StatusButton({
+    required this.label,
+    required this.icon,
+    required this.color,
+    required this.isSelected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          decoration: BoxDecoration(
+            color: isSelected ? color : color.withValues(alpha: 0.1),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: color,
+              width: isSelected ? 0 : 1,
+            ),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
+                size: 18,
+                color: isSelected ? Colors.white : color,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                  color: isSelected ? Colors.white : color,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Mock list removed – data now loaded from Supabase

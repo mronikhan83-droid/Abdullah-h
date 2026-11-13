@@ -1,0 +1,304 @@
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+import '../models/student.dart';
+import 'base_repository.dart';
+
+class StudentRepository extends BaseRepository {
+  StudentRepository(super.client);
+
+  Future<List<Student>> getStudents({
+    String? sectionId,
+    String? classId,
+    String? searchQuery,
+    bool activeOnly = true,
+    int limit = 25,
+    int offset = 0,
+  }) async {
+    // When filtering by section or class, use inner join to only return
+    // students with matching enrollments. Otherwise, use left join so
+    // students without enrollments still appear.
+    final needsEnrollmentFilter = sectionId != null || classId != null;
+
+    final enrollJoin = needsEnrollmentFilter
+        ? '''student_enrollments!inner(
+            id, tenant_id, student_id, section_id, academic_year_id,
+            roll_number, status, enrollment_date, created_at,
+            sections!inner(id, name, classes!inner(id, name)),
+            academic_years!inner(id, name, is_current)
+          )'''
+        : '''student_enrollments(
+            id, tenant_id, student_id, section_id, academic_year_id,
+            roll_number, status, enrollment_date, created_at,
+            sections(id, name, classes(id, name)),
+            academic_years(id, name, is_current)
+          )''';
+
+    var query = client
+        .from('students')
+        .select('*, $enrollJoin')
+        .eq('tenant_id', requireTenantId);
+
+    if (activeOnly) {
+      query = query.eq('is_active', true);
+    }
+
+    if (needsEnrollmentFilter) {
+      query = query.eq('student_enrollments.academic_years.is_current', true);
+    }
+
+    if (sectionId != null) {
+      query = query.eq('student_enrollments.section_id', sectionId);
+    }
+
+    if (classId != null) {
+      query = query.eq('student_enrollments.sections.class_id', classId);
+    }
+
+    if (searchQuery != null && searchQuery.isNotEmpty) {
+      query = query.or(
+        'first_name.ilike.%$searchQuery%,'
+        'last_name.ilike.%$searchQuery%,'
+        'admission_number.ilike.%$searchQuery%',
+      );
+    }
+
+    final response = await query
+        .order('first_name')
+        .range(offset, offset + limit - 1);
+
+    return (response as List).map((json) => Student.fromJson(json)).toList();
+  }
+
+  Future<int> getStudentCount({
+    String? classId,
+    String? sectionId,
+    String? searchQuery,
+  }) async {
+    var query = client
+        .from('students')
+        .count(CountOption.exact)
+        .eq('tenant_id', requireTenantId)
+        .eq('is_active', true);
+
+    if (classId != null) {
+      query = query.eq('class_id', classId);
+    }
+    if (sectionId != null) {
+      query = query.eq('section_id', sectionId);
+    }
+    if (searchQuery != null && searchQuery.isNotEmpty) {
+      query = query.or(
+        'first_name.ilike.%$searchQuery%,'
+        'last_name.ilike.%$searchQuery%,'
+        'admission_number.ilike.%$searchQuery%',
+      );
+    }
+
+    return await query;
+  }
+
+  Future<Student?> getStudentById(String studentId) async {
+    final response = await client
+        .from('students')
+        .select('''
+          *,
+          student_enrollments(
+            id,
+            section_id,
+            academic_year_id,
+            roll_number,
+            status,
+            sections(id, name, classes(id, name)),
+            academic_years(id, name, is_current)
+          ),
+          student_parents(
+            id,
+            is_primary,
+            parents(*)
+          )
+        ''')
+        .eq('id', studentId)
+        .single();
+
+    return Student.fromJson(response);
+  }
+
+  Future<Student?> getStudentByUserId(String userId) async {
+    final response = await client
+        .from('students')
+        .select('''
+          *,
+          student_enrollments(
+            id,
+            section_id,
+            academic_year_id,
+            roll_number,
+            status,
+            sections(id, name, classes(id, name)),
+            academic_years(id, name, is_current)
+          )
+        ''')
+        .eq('user_id', userId)
+        .maybeSingle();
+
+    if (response == null) return null;
+    return Student.fromJson(response);
+  }
+
+  Future<List<Student>> getStudentsBySection(String sectionId, {int limit = 100, int offset = 0}) async {
+    final response = await client
+        .from('students')
+        .select('''
+          *,
+          student_enrollments!inner(
+            id,
+            section_id,
+            roll_number,
+            status,
+            academic_years!inner(is_current)
+          )
+        ''')
+        .eq('tenant_id', requireTenantId)
+        .eq('student_enrollments.section_id', sectionId)
+        .eq('student_enrollments.academic_years.is_current', true)
+        .eq('student_enrollments.status', 'active')
+        .eq('is_active', true)
+        .order('first_name')
+        .range(offset, offset + limit - 1);
+
+    return (response as List).map((json) => Student.fromJson(json)).toList();
+  }
+
+  Future<Student> createStudent(Map<String, dynamic> data) async {
+    data['tenant_id'] = tenantId;
+    
+    final response = await client
+        .from('students')
+        .insert(data)
+        .select()
+        .single();
+
+    return Student.fromJson(response);
+  }
+
+  Future<Student> updateStudent(String studentId, Map<String, dynamic> data) async {
+    data['updated_at'] = DateTime.now().toIso8601String();
+    
+    final response = await client
+        .from('students')
+        .update(data)
+        .eq('id', studentId)
+        .select()
+        .single();
+
+    return Student.fromJson(response);
+  }
+
+  Future<int> getNextRollNumber({
+    required String sectionId,
+    required String academicYearId,
+  }) async {
+    final response = await client
+        .from('student_enrollments')
+        .select('roll_number')
+        .eq('section_id', sectionId)
+        .eq('academic_year_id', academicYearId)
+        .order('roll_number', ascending: false)
+        .limit(1);
+
+    if (response.isNotEmpty) {
+      final latest = response.first['roll_number'];
+      final latestInt = latest is int
+          ? latest
+          : int.tryParse(latest?.toString() ?? '') ?? 0;
+      return latestInt + 1;
+    }
+
+    return 1;
+  }
+
+  Future<void> enrollStudent({
+    required String studentId,
+    required String sectionId,
+    required String academicYearId,
+    String? rollNumber,
+  }) async {
+    await client.from('student_enrollments').insert({
+      'tenant_id': tenantId,
+      'student_id': studentId,
+      'section_id': sectionId,
+      'academic_year_id': academicYearId,
+      'roll_number': rollNumber,
+      'status': 'active',
+    });
+  }
+
+  Future<void> changeSection({
+    required String studentId,
+    required String newSectionId,
+    required String academicYearId,
+  }) async {
+    await client
+        .from('student_enrollments')
+        .update({'section_id': newSectionId})
+        .eq('student_id', studentId)
+        .eq('academic_year_id', academicYearId);
+  }
+
+  Future<void> deactivateStudent(String studentId) async {
+    await client
+        .from('students')
+        .update({
+          'is_active': false,
+          'updated_at': DateTime.now().toIso8601String(),
+        })
+        .eq('id', studentId);
+  }
+
+  Future<List<Map<String, dynamic>>> getParentChildren(String userId) async {
+    final response = await client.rpc('get_parent_children', params: {
+      'p_user_id': userId,
+    });
+    return List<Map<String, dynamic>>.from(response);
+  }
+
+  Future<Map<String, dynamic>?> getStudentCurrentEnrollment(String studentId) async {
+    final response = await client.rpc('get_student_current_enrollment', params: {
+      'p_student_id': studentId,
+    });
+    if (response is List && response.isNotEmpty) {
+      return response.first as Map<String, dynamic>;
+    }
+    return null;
+  }
+
+  Future<Student?> getStudentByAdmissionNumber(String admissionNumber) async {
+    final response = await client
+        .from('students')
+        .select('''
+          *,
+          student_enrollments(
+            id,
+            section_id,
+            academic_year_id,
+            roll_number,
+            status,
+            sections(id, name, classes(id, name)),
+            academic_years(id, name, is_current)
+          ),
+          student_parents(
+            id,
+            is_primary,
+            parents(*)
+          )
+        ''')
+        .eq('tenant_id', requireTenantId)
+        .eq('admission_number', admissionNumber)
+        .eq('is_active', true)
+        .maybeSingle();
+
+    if (response == null) return null;
+    return Student.fromJson(response);
+  }
+
+}

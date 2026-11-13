@@ -1,0 +1,560 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import 'package:intl/intl.dart';
+
+import '../../../../core/theme/app_colors.dart';
+import '../../../../data/models/tenant.dart';
+import '../../../../shared/extensions/context_extensions.dart';
+import '../../../../shared/widgets/glass_card.dart';
+import '../../providers/tenant_provider.dart';
+import '../../../../core/copy/warm_strings.dart';
+
+class TenantsListScreen extends ConsumerStatefulWidget {
+  const TenantsListScreen({super.key});
+
+  @override
+  ConsumerState<TenantsListScreen> createState() => _TenantsListScreenState();
+}
+
+class _TenantsListScreenState extends ConsumerState<TenantsListScreen> {
+  String _searchQuery = '';
+  String _statusFilter = 'all';
+  String _planFilter = 'all';
+
+  @override
+  void initState() {
+    super.initState();
+    Future.microtask(
+        () => ref.read(tenantsNotifierProvider.notifier).loadTenants());
+  }
+
+  List<Tenant> _filterTenants(List<Tenant> tenants) {
+    return tenants.where((t) {
+      if (_searchQuery.isNotEmpty) {
+        final query = _searchQuery.toLowerCase();
+        if (!t.name.toLowerCase().contains(query) &&
+            !t.slug.toLowerCase().contains(query) &&
+            !(t.email?.toLowerCase().contains(query) ?? false)) {
+          return false;
+        }
+      }
+      if (_statusFilter != 'all') {
+        if (_statusFilter == 'active' && !t.isActive) return false;
+        if (_statusFilter == 'suspended' && t.isActive) return false;
+        if (_statusFilter == 'trial' &&
+            t.subscriptionPlan.toLowerCase() != 'trial') {
+          return false;
+        }
+      }
+      if (_planFilter != 'all' && t.subscriptionPlan != _planFilter) {
+        return false;
+      }
+      return true;
+    }).toList();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final tenantsAsync = ref.watch(tenantsNotifierProvider);
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Tenants'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: () =>
+                ref.read(tenantsNotifierProvider.notifier).loadTenants(),
+            tooltip: 'Refresh',
+          ),
+          IconButton(
+            icon: const Icon(Icons.download),
+            onPressed: _exportTenants,
+            tooltip: 'Export',
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          _buildFilters(theme, colorScheme),
+          Expanded(
+            child: tenantsAsync.when(
+              loading: () =>
+                  const Center(child: CircularProgressIndicator()),
+              error: (e, _) => Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(Icons.error_outline,
+                        size: 48, color: AppColors.error),
+                    const SizedBox(height: 16),
+                    Text(WarmCopy.genericError),
+                    const SizedBox(height: 16),
+                    ElevatedButton(
+                      onPressed: () => ref
+                          .read(tenantsNotifierProvider.notifier)
+                          .loadTenants(),
+                      child: const Text('Retry'),
+                    ),
+                  ],
+                ),
+              ),
+              data: (tenants) {
+                final filteredTenants = _filterTenants(tenants);
+                if (filteredTenants.isEmpty) {
+                  final hasActiveFilters = _searchQuery.isNotEmpty ||
+                      _statusFilter != 'all' ||
+                      _planFilter != 'all';
+                  return Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.search_off,
+                            size: 48,
+                            color: theme.textTheme.bodySmall?.color),
+                        const SizedBox(height: 12),
+                        Text('No tenants found',
+                            style: theme.textTheme.titleSmall),
+                        if (hasActiveFilters) ...[
+                          const SizedBox(height: 4),
+                          Text('Try adjusting your filters',
+                              style: theme.textTheme.bodySmall),
+                          const SizedBox(height: 16),
+                          TextButton.icon(
+                            onPressed: () => setState(() {
+                              _searchQuery = '';
+                              _statusFilter = 'all';
+                              _planFilter = 'all';
+                            }),
+                            icon: const Icon(Icons.filter_alt_off, size: 18),
+                            label: const Text('Clear filters'),
+                          ),
+                        ],
+                      ],
+                    ),
+                  );
+                }
+                return RefreshIndicator(
+                  onRefresh: () => ref
+                      .read(tenantsNotifierProvider.notifier)
+                      .loadTenants(),
+                  child: ListView.builder(
+                    padding: const EdgeInsets.all(16),
+                    itemCount: filteredTenants.length,
+                    itemBuilder: (context, index) {
+                      final tenant = filteredTenants[index];
+                      return _TenantCard(
+                        tenant: tenant,
+                        onTap: () => context
+                            .push('/super-admin/tenants/${tenant.id}'),
+                        onAction: (action) =>
+                            _handleAction(action, tenant),
+                      );
+                    },
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => context.push('/super-admin/tenants/create'),
+        icon: const Icon(Icons.add),
+        label: const Text('Add Tenant'),
+      ),
+    );
+  }
+
+  Widget _buildFilters(ThemeData theme, ColorScheme colorScheme) {
+    final isDark = theme.brightness == Brightness.dark;
+    final inputFill = isDark ? AppColors.surfaceDark : AppColors.grey50;
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        children: [
+          // Search field — uses theme InputDecorationTheme
+          TextField(
+            decoration: InputDecoration(
+              hintText: 'Search tenants...',
+              prefixIcon: const Icon(Icons.search),
+              border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none),
+              filled: true,
+              fillColor: inputFill,
+            ),
+            onChanged: (v) => setState(() => _searchQuery = v),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: DropdownButtonFormField<String>(
+                  initialValue: _statusFilter,
+                  decoration: InputDecoration(
+                    labelText: 'Status',
+                    border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none),
+                    filled: true,
+                    fillColor: inputFill,
+                    contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 8),
+                  ),
+                  dropdownColor: isDark ? AppColors.surfaceDark : Colors.white,
+                  items: const [
+                    DropdownMenuItem(
+                        value: 'all', child: Text('All Status')),
+                    DropdownMenuItem(
+                        value: 'active', child: Text('Active')),
+                    DropdownMenuItem(
+                        value: 'trial', child: Text('Trial')),
+                    DropdownMenuItem(
+                        value: 'suspended', child: Text('Suspended')),
+                  ],
+                  onChanged: (v) => setState(() => _statusFilter = v!),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: DropdownButtonFormField<String>(
+                  initialValue: _planFilter,
+                  decoration: InputDecoration(
+                    labelText: 'Plan',
+                    border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none),
+                    filled: true,
+                    fillColor: inputFill,
+                    contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 8),
+                  ),
+                  dropdownColor: isDark ? AppColors.surfaceDark : Colors.white,
+                  items: const [
+                    DropdownMenuItem(
+                        value: 'all', child: Text('All Plans')),
+                    DropdownMenuItem(
+                        value: 'trial', child: Text('Trial')),
+                    DropdownMenuItem(
+                        value: 'basic', child: Text('Basic')),
+                    DropdownMenuItem(value: 'pro', child: Text('Pro')),
+                    DropdownMenuItem(
+                        value: 'enterprise', child: Text('Enterprise')),
+                    DropdownMenuItem(
+                        value: 'free', child: Text('Free')),
+                  ],
+                  onChanged: (v) => setState(() => _planFilter = v!),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _handleAction(String action, Tenant tenant) {
+    switch (action) {
+      case 'suspend':
+        _showSuspendDialog(tenant);
+        break;
+      case 'activate':
+        _activateTenant(tenant);
+        break;
+      case 'delete':
+        _showDeleteDialog(tenant);
+        break;
+    }
+  }
+
+  void _showSuspendDialog(Tenant tenant) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Suspend Tenant'),
+        content: Text(
+            'Suspend "${tenant.name}"? All users will lose access.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              try {
+                await ref
+                    .read(tenantsNotifierProvider.notifier)
+                    .suspendTenant(tenant.id);
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                        content: Text('Tenant suspended'),
+                        backgroundColor: AppColors.warning),
+                  );
+                }
+              } catch (e) {
+                if (mounted) {
+                  context.showErrorSnackBar(WarmCopy.genericError);
+                }
+              }
+            },
+            style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.warning),
+            child: const Text('Suspend'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _activateTenant(Tenant tenant) async {
+    try {
+      await ref
+          .read(tenantsNotifierProvider.notifier)
+          .activateTenant(tenant.id);
+      if (mounted) {
+        context.showSuccessSnackBar('Tenant activated');
+      }
+    } catch (e) {
+      if (mounted) {
+        context.showErrorSnackBar(WarmCopy.genericError);
+      }
+    }
+  }
+
+  void _showDeleteDialog(Tenant tenant) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete Tenant'),
+        content: Text(
+            'Permanently delete "${tenant.name}"? This action cannot be undone.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              try {
+                await ref
+                    .read(tenantsNotifierProvider.notifier)
+                    .deleteTenant(tenant.id);
+                if (mounted) {
+                  context.showSuccessSnackBar('Tenant deleted');
+                }
+              } catch (e) {
+                if (mounted) {
+                  context.showErrorSnackBar(WarmCopy.genericError);
+                }
+              }
+            },
+            style:
+                ElevatedButton.styleFrom(backgroundColor: AppColors.error),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _exportTenants() {
+    ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Exporting tenants...')));
+  }
+}
+
+class _TenantCard extends StatelessWidget {
+  final Tenant tenant;
+  final VoidCallback onTap;
+  final Function(String) onAction;
+
+  const _TenantCard(
+      {required this.tenant, required this.onTap, required this.onAction});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isActive = tenant.isActive;
+    final isSuspended = !tenant.isActive;
+    final status = isActive ? 'active' : 'suspended';
+    final subscriptionEnd = tenant.subscriptionExpiresAt ??
+        DateTime.now().add(const Duration(days: 365));
+    final isExpiringSoon =
+        subscriptionEnd.difference(DateTime.now()).inDays <= 30;
+    final statusColor = _getStatusColor(status);
+
+    return GlassCard(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: EdgeInsets.zero,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(16),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  CircleAvatar(
+                    radius: 24,
+                    backgroundColor: statusColor.withValues(alpha: 0.12),
+                    child: Text(
+                      tenant.name.substring(0, 1),
+                      style: TextStyle(
+                          color: statusColor,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 18),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(tenant.name,
+                            style: theme.textTheme.titleSmall?.copyWith(
+                                fontWeight: FontWeight.bold)),
+                        Text('${tenant.slug}.schoolsaas.com',
+                            style: theme.textTheme.bodySmall),
+                      ],
+                    ),
+                  ),
+                  PopupMenuButton<String>(
+                    onSelected: onAction,
+                    itemBuilder: (context) => [
+                      if (isSuspended)
+                        const PopupMenuItem(
+                            value: 'activate',
+                            child: Row(children: [
+                              Icon(Icons.check_circle,
+                                  size: 18, color: AppColors.success),
+                              SizedBox(width: 8),
+                              Text('Activate')
+                            ]))
+                      else
+                        const PopupMenuItem(
+                            value: 'suspend',
+                            child: Row(children: [
+                              Icon(Icons.block,
+                                  size: 18, color: AppColors.warning),
+                              SizedBox(width: 8),
+                              Text('Suspend')
+                            ])),
+                      const PopupMenuItem(
+                          value: 'delete',
+                          child: Row(children: [
+                            Icon(Icons.delete,
+                                size: 18, color: AppColors.error),
+                            SizedBox(width: 8),
+                            Text('Delete',
+                                style: TextStyle(color: AppColors.error))
+                          ])),
+                    ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  _buildChip(context, Icons.email, tenant.email ?? 'No email'),
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: statusColor.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          isActive
+                              ? Icons.check_circle_outline
+                              : Icons.block_outlined,
+                          size: 12,
+                          color: statusColor,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          status.toUpperCase(),
+                          style: TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                              color: statusColor),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Text('Plan: ${tenant.subscriptionPlan.toUpperCase()}',
+                      style: theme.textTheme.bodySmall),
+                  const SizedBox(width: 16),
+                  Icon(Icons.calendar_today,
+                      size: 12,
+                      color: isExpiringSoon
+                          ? AppColors.warning
+                          : theme.textTheme.bodySmall?.color),
+                  const SizedBox(width: 4),
+                  Text(
+                    'Expires: ${DateFormat('MMM d, yyyy').format(subscriptionEnd)}',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: isExpiringSoon ? AppColors.warning : null,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildChip(BuildContext context, IconData icon, String label) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: isDark
+            ? Colors.white.withValues(alpha: 0.08)
+            : Colors.grey.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 12, color: theme.textTheme.bodySmall?.color),
+          const SizedBox(width: 4),
+          Text(label, style: theme.textTheme.bodySmall?.copyWith(fontSize: 11)),
+        ],
+      ),
+    );
+  }
+
+  Color _getStatusColor(String status) {
+    switch (status) {
+      case 'active':
+        return AppColors.success;
+      case 'trial':
+        return AppColors.warning;
+      case 'suspended':
+        return AppColors.error;
+      default:
+        return Colors.grey;
+    }
+  }
+}

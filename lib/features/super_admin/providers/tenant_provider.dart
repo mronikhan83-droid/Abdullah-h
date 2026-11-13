@@ -1,0 +1,136 @@
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../core/providers/supabase_provider.dart';
+
+import '../../../data/models/tenant.dart';
+import '../../../data/repositories/tenant_repository.dart';
+
+/// Tenant repository provider
+final tenantRepositoryProvider = Provider<TenantRepository>((ref) {
+  return TenantRepository(ref.watch(supabaseProvider));
+});
+
+/// All tenants provider
+final tenantsProvider = FutureProvider.autoDispose.family<List<Tenant>, TenantsFilter>(
+  (ref, filter) async {
+    final repository = ref.watch(tenantRepositoryProvider);
+    return repository.getAllTenants(
+      status: filter.status,
+      searchQuery: filter.searchQuery,
+    );
+  },
+);
+
+/// Single tenant provider
+final tenantByIdProvider = FutureProvider.autoDispose.family<Tenant?, String>(
+  (ref, tenantId) async {
+    final repository = ref.watch(tenantRepositoryProvider);
+    return repository.getTenantById(tenantId);
+  },
+);
+
+/// Tenant statistics provider
+final tenantStatsProvider = FutureProvider.autoDispose.family<Map<String, dynamic>, String>(
+  (ref, tenantId) async {
+    final repository = ref.watch(tenantRepositoryProvider);
+    return repository.getTenantStats(tenantId);
+  },
+);
+
+/// Platform statistics provider (Super Admin)
+final platformStatsProvider = FutureProvider.autoDispose<Map<String, dynamic>>((ref) async {
+  final repository = ref.watch(tenantRepositoryProvider);
+  return repository.getPlatformStats();
+});
+
+/// Tenant users provider
+final tenantUsersProvider = FutureProvider.autoDispose.family<List<Map<String, dynamic>>, String>(
+  (ref, tenantId) async {
+    final repository = ref.watch(tenantRepositoryProvider);
+    return repository.getTenantUsers(tenantId);
+  },
+);
+
+/// Tenant users filtered by role
+final tenantUsersByRoleProvider =
+    FutureProvider.autoDispose.family<List<Map<String, dynamic>>, ({String tenantId, String role})>(
+  (ref, params) async {
+    final repository = ref.watch(tenantRepositoryProvider);
+    return repository.getTenantUsersByRole(params.tenantId, params.role);
+  },
+);
+
+/// Tenants filter
+class TenantsFilter {
+  final String? status;
+  final String? searchQuery;
+
+  const TenantsFilter({
+    this.status,
+    this.searchQuery,
+  });
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is TenantsFilter &&
+        other.status == status &&
+        other.searchQuery == searchQuery;
+  }
+
+  @override
+  int get hashCode => Object.hash(status, searchQuery);
+}
+
+/// Tenants state notifier for CRUD operations
+class TenantsNotifier extends StateNotifier<AsyncValue<List<Tenant>>> {
+  final TenantRepository _repository;
+
+  TenantsNotifier(this._repository, Ref ref) : super(const AsyncValue.loading());
+
+  Future<void> loadTenants({String? status, String? searchQuery}) async {
+    state = const AsyncValue.loading();
+    try {
+      final tenants = await _repository.getAllTenants(
+        status: status,
+        searchQuery: searchQuery,
+      );
+      state = AsyncValue.data(tenants);
+    } catch (e, st) {
+      state = AsyncValue.error(e, st);
+    }
+  }
+
+  Future<Tenant> createTenant(Map<String, dynamic> data) async {
+    final tenant = await _repository.createTenant(data);
+    await loadTenants();
+    return tenant;
+  }
+
+  Future<Tenant> updateTenant(String tenantId, Map<String, dynamic> data) async {
+    final tenant = await _repository.updateTenant(tenantId, data);
+    await loadTenants();
+    return tenant;
+  }
+
+  Future<void> suspendTenant(String tenantId) async {
+    await _repository.suspendTenant(tenantId);
+    await loadTenants();
+  }
+
+  Future<void> activateTenant(String tenantId) async {
+    await _repository.activateTenant(tenantId);
+    await loadTenants();
+  }
+
+  Future<void> deleteTenant(String tenantId) async {
+    await _repository.deleteTenant(tenantId);
+    await loadTenants();
+  }
+}
+
+/// Tenants notifier provider
+final tenantsNotifierProvider =
+    StateNotifierProvider.autoDispose<TenantsNotifier, AsyncValue<List<Tenant>>>((ref) {
+  final repository = ref.watch(tenantRepositoryProvider);
+  return TenantsNotifier(repository, ref);
+});

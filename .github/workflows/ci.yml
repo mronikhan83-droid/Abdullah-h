@@ -1,0 +1,203 @@
+name: CI — Test + DB Push
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Separated jobs so a Supabase token rotation can't fail the test gate.
+# `test` is the PR status check. `db-push` runs only on main pushes and
+# self-skips if Supabase secrets are missing.
+
+jobs:
+  # ===========================================================
+  # TEST — analyzer + unit + widget tests
+  # ===========================================================
+  test:
+    name: Analyze + Unit + Widget Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch enough history so the migration-linter ratchet can diff
+          # the PR head against origin/main. Without this, depth=1 hides
+          # main entirely and the linter falls back to scanning legacy
+          # migrations it was supposed to ignore.
+          fetch-depth: 0
+
+      - name: Set up Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            .dart_tool
+          key: ${{ runner.os }}-pub-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Create .env for dotenv asset bundling
+        run: |
+          cat <<'EOF' > .env
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
+          APP_ENV=production
+          SHOW_DEMO_CREDENTIALS=false
+          SUPER_ADMIN_EMAIL=${{ secrets.SUPER_ADMIN_EMAIL }}
+          EOF
+          sed -i 's/^ *//' .env
+
+      - name: flutter analyze (zero errors gate)
+        run: |
+          flutter analyze --no-pub 2>&1 | tee /tmp/analyze.txt || true
+          if grep -qE "^   error " /tmp/analyze.txt; then
+            echo "::error::Analyzer errors found:"
+            grep -E "^   error " /tmp/analyze.txt
+            exit 1
+          fi
+
+      - name: Design-token discipline (ratchet)
+        # Fails the build when new Color(0xFF…) or fontSize: literals are
+        # added to lib/features/. Existing violations are pinned in
+        # tool/design_token_lint_baseline.json — remove some, then run
+        # `dart run tool/design_token_lint.dart --update-baseline` to lock in.
+        run: dart run tool/design_token_lint.dart
+
+      - name: Migration linter (Squawk)
+        # Blocks dangerous schema changes before they reach prod:
+        # ADD COLUMN NOT NULL without default, DROP COLUMN, missing
+        # CONCURRENTLY on indexes, etc. See docs/runbooks/migrations.md.
+        run: bash tool/squawk_lint.sh
+
+      - name: Unit + widget tests (parallel)
+        run: flutter test test/ --reporter=github --concurrency=4
+
+  # ===========================================================
+  # DB PUSH — Supabase migrations (only on main, tolerant of missing secrets)
+  # ===========================================================
+  db-push:
+    name: Push Supabase Migrations
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Check Supabase secrets are configured
+        id: secrets_check
+        run: |
+          if [ -z "${{ secrets.SUPABASE_ACCESS_TOKEN }}" ] || [ -z "${{ secrets.SUPABASE_PROJECT_REF }}" ]; then
+            echo "::warning::SUPABASE_ACCESS_TOKEN or SUPABASE_PROJECT_REF not set — skipping DB push. Rotate token in repo settings to re-enable."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Link Supabase project
+        if: steps.secrets_check.outputs.skip == 'false'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          if ! supabase link --project-ref ${{ secrets.SUPABASE_PROJECT_REF }}; then
+            echo "::warning::supabase link failed (token expired or project ref wrong). Rotate SUPABASE_ACCESS_TOKEN."
+            exit 0
+          fi
+
+      - name: Push database migrations
+        if: steps.secrets_check.outputs.skip == 'false'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          if ! supabase db push --include-all; then
+            echo "::warning::supabase db push failed. Inspect migrations and re-run manually."
+            exit 0
+          fi
+
+  # ===========================================================
+  # DEPLOY — Flutter Web → GitHub Pages
+  # ===========================================================
+  deploy:
+    name: Deploy Flutter Web to GitHub Pages
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            .dart_tool
+          key: ${{ runner.os }}-pub-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Create .env for dotenv asset bundling
+        run: |
+          cat <<'EOF' > .env
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
+          APP_ENV=production
+          SHOW_DEMO_CREDENTIALS=true
+          SUPER_ADMIN_EMAIL=${{ secrets.SUPER_ADMIN_EMAIL }}
+          EOF
+          sed -i 's/^ *//' .env
+
+      - name: Build Flutter web (release, tree-shake icons, bundled CanvasKit)
+        # --no-web-resources-cdn bundles CanvasKit (canvaskit.js + canvaskit.wasm)
+        # into build/web/canvaskit/ instead of fetching from gstatic.com at
+        # runtime. Browsers with strict shields (Brave, hardened Firefox,
+        # uBlock-aggressive Chromium) block gstatic.com as a Google tracker;
+        # without bundled CanvasKit those visitors see a blank page.
+        run: flutter build web --release --base-href /Flutter-school-management-/ --tree-shake-icons --no-web-resources-cdn
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/web
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

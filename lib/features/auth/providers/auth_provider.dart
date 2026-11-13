@@ -1,0 +1,388 @@
+import 'dart:developer' as developer;
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+import '../../../core/config/app_environment.dart';
+import '../../../core/providers/supabase_provider.dart';
+import '../../../data/models/user.dart';
+
+/// Auth state provider (Supabase session)
+final authStateProvider = StreamProvider<Session?>((ref) {
+  final supabase = ref.watch(supabaseProvider);
+  return supabase.auth.onAuthStateChange.map((event) => event.session);
+});
+
+/// Current user provider — derived from [authNotifierProvider] so it is
+/// always in sync with the auth state and never holds a stale copy.
+final currentUserProvider = Provider<AppUser?>((ref) {
+  return ref.watch(authNotifierProvider).valueOrNull;
+});
+
+/// Current tenant ID provider — derived from [authNotifierProvider].
+final currentTenantIdProvider = Provider<String?>((ref) {
+  final user = ref.watch(authNotifierProvider).valueOrNull;
+  return user?.tenantId;
+});
+
+/// Auth repository provider
+final authRepositoryProvider = Provider<AuthRepository>((ref) {
+  return AuthRepository(ref.watch(supabaseProvider));
+});
+
+/// Auth repository
+class AuthRepository {
+  final SupabaseClient _client;
+
+  AuthRepository(this._client);
+
+  /// Get current session
+  Session? get currentSession => _client.auth.currentSession;
+
+  /// Get current user
+  User? get currentUser => _client.auth.currentUser;
+
+  /// Sign in with email and password
+  Future<AuthResponse> signInWithEmail({
+    required String email,
+    required String password,
+  }) async {
+    if (kDebugMode) {
+      developer.log('AuthRepository signInWithEmail(email: $email)', name: 'AuthRepository');
+    }
+    return await _client.auth.signInWithPassword(
+      email: email,
+      password: password,
+    );
+  }
+
+  /// Sign up with email and password
+  Future<AuthResponse> signUpWithEmail({
+    required String email,
+    required String password,
+    String? fullName,
+  }) async {
+    if (kDebugMode) {
+      developer.log('AuthRepository signUpWithEmail(email: $email)', name: 'AuthRepository');
+    }
+    return await _client.auth.signUp(
+      email: email,
+      password: password,
+      data: {
+        if (fullName != null) 'full_name': fullName,
+      },
+    );
+  }
+
+  /// Sign out
+  Future<void> signOut() async {
+    if (kDebugMode) {
+      developer.log('AuthRepository signOut()', name: 'AuthRepository');
+    }
+    await _client.auth.signOut();
+  }
+
+  /// Reset password
+  Future<void> resetPassword(String email) async {
+    await _client.auth.resetPasswordForEmail(email);
+  }
+
+  /// Update password
+  Future<UserResponse> updatePassword(String newPassword) async {
+    return await _client.auth.updateUser(
+      UserAttributes(password: newPassword),
+    );
+  }
+
+  /// Get user profile from database
+  Future<AppUser?> getUserProfile(String userId) async {
+    if (kDebugMode) {
+      developer.log('AuthRepository getUserProfile(userId: $userId)', name: 'AuthRepository');
+    }
+    final response = await _client
+        .from('users')
+        .select('''
+          *,
+          user_roles(role, is_primary, tenant_id)
+        ''')
+        .eq('id', userId)
+        .maybeSingle();
+
+    if (response == null) return null;
+    return AppUser.fromJson(response);
+  }
+
+  /// Create user profile in database
+  Future<void> createUserProfile({
+    required String userId,
+    required String email,
+    String? fullName,
+    String? tenantId,
+  }) async {
+    await _client.from('users').insert({
+      'id': userId,
+      'email': email,
+      'full_name': fullName,
+      'tenant_id': tenantId,
+    });
+  }
+
+  /// Creates a system tenant for super_admin users (if it doesn't exist).
+  /// Returns the system tenant ID.
+  Future<String> _ensureSystemTenant() async {
+    const systemTenantId = '00000000-0000-0000-0000-000000000001';
+    await _client.from('tenants').upsert({
+      'id': systemTenantId,
+      'name': 'System',
+      'slug': 'system',
+      'is_active': true,
+    }, onConflict: 'id');
+    return systemTenantId;
+  }
+
+  /// Creates user profile + assigns role.
+  /// If email matches superAdminEmail, assigns super_admin on system tenant.
+  /// Otherwise creates profile with no role (pending admin assignment).
+  Future<void> createUserWithRole({
+    required String userId,
+    required String email,
+    String? fullName,
+    String? phone,
+  }) async {
+    // TODO(sprint-2): super_admin promotion moved to edge function — see
+    // SPRINT_PLAN_2026-05-16.md task 2.4. Role is server-enforced via
+    // user_roles table; client-side email-match is kept only as a
+    // provisional bootstrap until the edge function is deployed.
+    final isSuperAdmin = AppEnvironment.superAdminEmail != null &&
+        email.toLowerCase().trim() == AppEnvironment.superAdminEmail;
+
+    String? tenantId;
+    String? role;
+
+    if (isSuperAdmin) {
+      tenantId = await _ensureSystemTenant();
+      role = 'super_admin';
+    }
+
+    // Create profile
+    await _client.from('users').insert({
+      'id': userId,
+      'email': email,
+      'full_name': fullName,
+      if (phone != null) 'phone': phone,
+      if (tenantId != null) 'tenant_id': tenantId,
+      'is_active': true,
+    });
+
+    // Assign role if super_admin
+    if (tenantId != null && role != null) {
+      await _client.from('user_roles').insert({
+        'user_id': userId,
+        'tenant_id': tenantId,
+        'role': role,
+        'is_primary': true,
+      });
+
+      // Refresh session so the JWT reflects the updated app_metadata
+      // (the on_user_role_change trigger updates auth.users.raw_app_meta_data)
+      await _client.auth.refreshSession();
+    }
+  }
+
+  /// Mark a user's profile as complete.
+  Future<void> markProfileComplete(String userId) async {
+    await _client
+        .from('users')
+        .update({'profile_complete': true, 'updated_at': DateTime.now().toIso8601String()})
+        .eq('id', userId);
+  }
+
+  /// Update user profile
+  Future<void> updateUserProfile({
+    required String userId,
+    String? fullName,
+    String? phone,
+    String? avatarUrl,
+  }) async {
+    await _client.from('users').update({
+      if (fullName != null) 'full_name': fullName,
+      if (phone != null) 'phone': phone,
+      if (avatarUrl != null) 'avatar_url': avatarUrl,
+      'updated_at': DateTime.now().toIso8601String(),
+    }).eq('id', userId);
+  }
+
+  /// Get user's tenants (schools)
+  Future<List<Map<String, dynamic>>> getUserTenants(String userId) async {
+    final response = await _client
+        .from('user_roles')
+        .select('tenant:tenants(id, name, slug, logo_url)')
+        .eq('user_id', userId);
+
+    return (response as List)
+        .map((r) => r['tenant'] as Map<String, dynamic>)
+        .toSet()
+        .toList();
+  }
+
+  /// Set current tenant in session
+  Future<void> setCurrentTenant(String tenantId) async {
+    // Store in app metadata
+    await _client.auth.updateUser(
+      UserAttributes(
+        data: {'current_tenant_id': tenantId},
+      ),
+    );
+  }
+}
+
+/// Auth notifier for managing auth state
+class AuthNotifier extends StateNotifier<AsyncValue<AppUser?>> {
+  // Nullable so the forTest constructor can omit it without unsafe casts.
+  // All production methods guard via the non-null assertion (!) — this field
+  // is only null when the forTest constructor is used.
+  final AuthRepository? _repository;
+
+  AuthNotifier(AuthRepository repository, Ref ref)
+      : _repository = repository,
+        super(const AsyncValue.loading()) {
+    _init();
+  }
+
+  /// Named constructor that skips [_init]. Used only in tests to inject a
+  /// predetermined [AsyncValue] without touching the network.
+  @visibleForTesting
+  AuthNotifier.forTest(super.initialState)
+      : _repository = null;
+
+  Future<void> _init() async {
+    final user = _repository!.currentUser;
+    if (user != null) {
+      await _loadUserProfile(user.id);
+    } else {
+      state = const AsyncValue.data(null);
+    }
+  }
+
+  Future<void> _loadUserProfile(String userId) async {
+    try {
+      if (kDebugMode) {
+        developer.log('_loadUserProfile: START - fetching profile for userId=$userId', name: 'AuthNotifier');
+      }
+      final profile = await _repository!.getUserProfile(userId);
+      if (kDebugMode) {
+        developer.log('_loadUserProfile: Raw profile response = $profile', name: 'AuthNotifier');
+      }
+
+      if (profile == null) {
+        if (kDebugMode) {
+          developer.log('_loadUserProfile: ERROR - profile is NULL for userId=$userId', name: 'AuthNotifier', level: 900);
+        }
+        state = AsyncValue.error('User profile not found', StackTrace.current);
+        return;
+      }
+
+      if (kDebugMode) {
+        developer.log('_loadUserProfile: profile.id = ${profile.id}', name: 'AuthNotifier');
+        developer.log('_loadUserProfile: profile.email = ${profile.email}', name: 'AuthNotifier');
+        developer.log('_loadUserProfile: profile.tenantId = ${profile.tenantId}', name: 'AuthNotifier');
+        developer.log('_loadUserProfile: profile.primaryRole = ${profile.primaryRole}', name: 'AuthNotifier');
+        developer.log('_loadUserProfile: profile.roles = ${profile.roles}', name: 'AuthNotifier');
+      }
+
+      state = AsyncValue.data(profile);
+      // currentUserProvider and currentTenantIdProvider are derived Providers
+      // that watch authNotifierProvider — no manual state assignment needed.
+
+      if (kDebugMode) {
+        developer.log('_loadUserProfile: SUCCESS - profile loaded and set', name: 'AuthNotifier');
+      }
+    } catch (e, st) {
+      if (kDebugMode) {
+        developer.log('_loadUserProfile: ERROR - $e', name: 'AuthNotifier', error: e, stackTrace: st);
+      }
+      state = AsyncValue.error(e, st);
+    }
+  }
+
+  Future<void> signIn({
+    required String email,
+    required String password,
+  }) async {
+    state = const AsyncValue.loading();
+    try {
+      final response = await _repository!.signInWithEmail(
+        email: email,
+        password: password,
+      );
+      if (response.user != null) {
+        await _loadUserProfile(response.user!.id);
+      }
+    } catch (e, st) {
+      state = AsyncValue.error(e, st);
+      rethrow;
+    }
+  }
+
+  Future<void> signUp({
+    required String email,
+    required String password,
+    String? fullName,
+    String? phone,
+  }) async {
+    state = const AsyncValue.loading();
+    try {
+      final repo = _repository!;
+      final response = await repo.signUpWithEmail(
+        email: email,
+        password: password,
+        fullName: fullName,
+      );
+      if (response.user != null) {
+        await repo.createUserWithRole(
+          userId: response.user!.id,
+          email: email,
+          fullName: fullName,
+          phone: phone,
+        );
+        await _loadUserProfile(response.user!.id);
+      }
+    } catch (e, st) {
+      state = AsyncValue.error(e, st);
+      rethrow;
+    }
+  }
+
+  Future<void> signOut() async {
+    await _repository!.signOut();
+    state = const AsyncValue.data(null);
+    // currentUserProvider and currentTenantIdProvider derive from this state;
+    // no manual notifier assignment needed.
+  }
+
+  Future<void> refreshProfile() async {
+    final user = _repository!.currentUser;
+    if (user != null) {
+      await _loadUserProfile(user.id);
+    }
+  }
+
+  /// Marks the current user's profile as complete and refreshes local state.
+  Future<void> markProfileComplete() async {
+    final repo = _repository!;
+    final user = repo.currentUser;
+    if (user == null) return;
+    await repo.markProfileComplete(user.id);
+    await _loadUserProfile(user.id);
+  }
+}
+
+/// Auth notifier provider
+final authNotifierProvider =
+    StateNotifierProvider<AuthNotifier, AsyncValue<AppUser?>>((ref) {
+  return AuthNotifier(
+    ref.watch(authRepositoryProvider),
+    ref,
+  );
+});

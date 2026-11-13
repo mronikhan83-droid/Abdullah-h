@@ -1,0 +1,331 @@
+import 'package:supabase_flutter/supabase_flutter.dart';
+import '../../core/net/idempotency.dart';
+import '../../core/net/retry.dart';
+import '../../core/services/offline_sync_service.dart';
+import '../models/attendance.dart';
+import 'base_repository.dart';
+
+class AttendanceRepository extends BaseRepository {
+  final OfflineSyncService? _syncService;
+
+  AttendanceRepository(super.client, [this._syncService]) {
+    // Wire per-record sync callback (Stage 3 / S3.21). One record at a
+    // time so one bad row doesn't block the rest of the queue; the
+    // sync service handles retry counting and dead-letter on its side.
+    if (_syncService != null) {
+      _syncService.onSyncOne = _syncOne;
+    }
+  }
+
+  Future<void> _syncOne(PendingAttendanceRecord r) async {
+    await client.from('attendance').upsert(
+      {
+        'tenant_id': tenantId,
+        'student_id': r.studentId,
+        'section_id': r.sectionId,
+        'date': r.date,
+        'status': r.status,
+        'remarks': r.remarks,
+        'marked_by': r.markedBy,
+        'marked_at': r.markedAt,
+        // The same key the record was enqueued with. Server-side
+        // UNIQUE(tenant_id, client_request_id) dedupes a retried-after-
+        // success write into a no-op.
+        'client_request_id': r.clientRequestId,
+      },
+      onConflict: 'student_id,date',
+    );
+  }
+
+  Future<List<Attendance>> getAttendanceBySection({
+    required String sectionId,
+    required DateTime date,
+  }) async {
+    final response = await client
+        .from('attendance')
+        .select('''
+          *,
+          students!inner(
+            id,
+            first_name,
+            last_name,
+            admission_number,
+            photo_url
+          )
+        ''')
+        .eq('section_id', sectionId)
+        .eq('date', date.toIso8601String().split('T')[0])
+        .limit(100);
+
+    return (response as List)
+        .map((json) => Attendance.fromJson(json))
+        .toList();
+  }
+
+  Future<List<Attendance>> getStudentAttendance({
+    required String studentId,
+    DateTime? startDate,
+    DateTime? endDate,
+    int limit = 100,
+    int offset = 0,
+  }) async {
+    var query = client
+        .from('attendance')
+        .select('*')
+        .eq('student_id', studentId);
+
+    if (startDate != null) {
+      query = query.gte('date', startDate.toIso8601String().split('T')[0]);
+    }
+    if (endDate != null) {
+      query = query.lte('date', endDate.toIso8601String().split('T')[0]);
+    }
+
+    final response = await query.order('date', ascending: false).range(offset, offset + limit - 1);
+    return (response as List)
+        .map((json) => Attendance.fromJson(json))
+        .toList();
+  }
+
+  Future<List<Map<String, dynamic>>> getAttendanceSummary({
+    required String studentId,
+    int? year,
+  }) async {
+    var query = client
+        .from('v_attendance_summary')
+        .select('*')
+        .eq('student_id', studentId);
+
+    if (year != null) {
+      query = query.eq('year', year);
+    }
+
+    final response = await query.order('month', ascending: false).limit(100);
+    return List<Map<String, dynamic>>.from(response);
+  }
+
+  Future<Map<String, dynamic>?> getSectionDailyAttendance({
+    required String sectionId,
+    required DateTime date,
+  }) async {
+    final response = await client
+        .from('v_section_daily_attendance')
+        .select('*')
+        .eq('section_id', sectionId)
+        .eq('date', date.toIso8601String().split('T')[0])
+        .maybeSingle();
+
+    return response;
+  }
+
+  /// Marks attendance for one student. Wrapped in [retryNetwork] +
+  /// idempotency keys (Stage 1 / S1.8 + Stage 2 / S2.17) so flaky-network
+  /// retries don't double-write. The existing `onConflict: 'student_id,date'`
+  /// already handles same-day toggles between present/absent; the new
+  /// `client_request_id` index handles the network-retry case.
+  ///
+  /// Caller may pass a stable [clientRequestId] when retrying themselves.
+  /// Default: generate a fresh UUID per call.
+  Future<void> markAttendance({
+    required String studentId,
+    required String sectionId,
+    required DateTime date,
+    required String status,
+    String? remarks,
+    String? clientRequestId,
+  }) async {
+    final key = clientRequestId ?? IdempotencyKey.generate();
+    await retryNetwork(
+      () => client.from('attendance').upsert({
+        'tenant_id': tenantId,
+        'student_id': studentId,
+        'section_id': sectionId,
+        'date': date.toIso8601String().split('T')[0],
+        'status': status,
+        'remarks': remarks,
+        'marked_by': currentUserId,
+        'marked_at': DateTime.now().toIso8601String(),
+        'client_request_id': key,
+      }, onConflict: 'student_id,date'),
+      label: 'attendance.mark',
+    );
+  }
+
+  Future<bool> markBulkAttendance({
+    required String sectionId,
+    required DateTime date,
+    required List<Map<String, dynamic>> attendanceRecords,
+  }) async {
+    final dateStr = date.toIso8601String().split('T')[0];
+    final now = DateTime.now().toIso8601String();
+
+    // If offline and sync service available, queue for later.
+    // `.fresh` stamps each record with a stable client_request_id +
+    // enqueued_at — see offline_sync_service for the retry/age semantics.
+    if (_syncService != null && !_syncService.isOnline) {
+      final pending = attendanceRecords
+          .map((record) => PendingAttendanceRecord.fresh(
+                studentId: record['student_id'],
+                sectionId: sectionId,
+                date: dateStr,
+                status: record['status'],
+                remarks: record['remarks'],
+                markedBy: currentUserId,
+                markedAt: now,
+              ))
+          .toList();
+      _syncService.enqueue(pending);
+      return false; // false = saved offline
+    }
+
+    // Online path — direct upsert
+    final records = attendanceRecords.map((record) => {
+      'tenant_id': tenantId,
+      'student_id': record['student_id'],
+      'section_id': sectionId,
+      'date': dateStr,
+      'status': record['status'],
+      'remarks': record['remarks'],
+      'marked_by': currentUserId,
+      'marked_at': now,
+    }).toList();
+
+    await client.from('attendance').upsert(
+      records,
+      onConflict: 'student_id,date',
+    );
+    return true; // true = saved online
+  }
+
+  Future<void> updateAttendance({
+    required String attendanceId,
+    required String status,
+    String? remarks,
+  }) async {
+    await client.from('attendance').update({
+      'status': status,
+      'remarks': remarks,
+      'marked_by': currentUserId,
+      'marked_at': DateTime.now().toIso8601String(),
+      'updated_at': DateTime.now().toIso8601String(),
+    }).eq('id', attendanceId);
+  }
+
+  /// Returns a map of studentId → attendance percentage (0–100) for every
+  /// student in [sectionId] over the last [window] days. Single round-trip;
+  /// aggregation done client-side to keep this row-level-safe under RLS.
+  /// Treats present + late + excused as "attended" (matches v_attendance_summary).
+  Future<Map<String, double>> getSectionAttendancePercents({
+    required String sectionId,
+    Duration window = const Duration(days: 60),
+  }) async {
+    final since =
+        DateTime.now().subtract(window).toIso8601String().split('T').first;
+    final response = await client
+        .from('attendance')
+        .select('student_id, status')
+        .eq('section_id', sectionId)
+        .gte('date', since);
+
+    final attended = <String, int>{};
+    final total = <String, int>{};
+    for (final row in response as List) {
+      final m = row as Map<String, dynamic>;
+      final sid = m['student_id'] as String?;
+      final status = (m['status'] as String?) ?? '';
+      if (sid == null) continue;
+      total[sid] = (total[sid] ?? 0) + 1;
+      if (status == 'present' || status == 'late' || status == 'excused') {
+        attended[sid] = (attended[sid] ?? 0) + 1;
+      }
+    }
+    final out = <String, double>{};
+    for (final sid in total.keys) {
+      final t = total[sid]!;
+      final a = attended[sid] ?? 0;
+      out[sid] = t == 0 ? 0 : (a / t) * 100;
+    }
+    return out;
+  }
+
+  Future<Map<String, int>> getAttendanceStats({
+    required String studentId,
+    String? academicYearId,
+  }) async {
+    final summary = await getAttendanceSummary(studentId: studentId);
+    
+    int totalDays = 0;
+    int presentDays = 0;
+    int absentDays = 0;
+    int lateDays = 0;
+    
+    for (final month in summary) {
+      totalDays += (month['total_days'] as num).toInt();
+      presentDays += (month['present_days'] as num).toInt();
+      absentDays += (month['absent_days'] as num).toInt();
+      lateDays += (month['late_days'] as num).toInt();
+    }
+    
+    return {
+      'total_days': totalDays,
+      'present_days': presentDays,
+      'absent_days': absentDays,
+      'late_days': lateDays,
+      'attendance_percentage': totalDays > 0 
+          ? ((presentDays + lateDays) * 100 ~/ totalDays) 
+          : 0,
+    };
+  }
+
+  Future<double> getTodayAttendancePercentage() async {
+    final today = DateTime.now().toIso8601String().split('T')[0];
+
+    final response = await client
+        .from('v_section_daily_attendance')
+        .select('attendance_percentage')
+        .eq('tenant_id', requireTenantId)
+        .eq('date', today)
+        .limit(100);
+
+    if (response.isEmpty) return 0;
+
+    final percentages = (response as List)
+        .map((r) => (r['attendance_percentage'] as num?)?.toDouble() ?? 0)
+        .toList();
+
+    return percentages.reduce((a, b) => a + b) / percentages.length;
+  }
+
+  /// Returns {'present': N, 'total': N} aggregated across all sections today.
+  Future<Map<String, int>> getTodayStudentCounts() async {
+    final today = DateTime.now().toIso8601String().split('T')[0];
+
+    final response = await client
+        .from('v_section_daily_attendance')
+        .select('present_count, total_students')
+        .eq('tenant_id', requireTenantId)
+        .eq('date', today)
+        .limit(200);
+
+    int present = 0;
+    int total = 0;
+    for (final row in (response as List)) {
+      present += (row['present_count'] as num? ?? 0).toInt();
+      total   += (row['total_students'] as num? ?? 0).toInt();
+    }
+    return {'present': present, 'total': total};
+  }
+
+  RealtimeChannel subscribeToSectionAttendance({
+    required String sectionId,
+    required DateTime date,
+    required void Function(PostgresChangePayload) onUpdate,
+  }) {
+    return subscribeToTable(
+      'attendance',
+      filter: (column: 'section_id', value: sectionId),
+      onInsert: onUpdate,
+      onUpdate: onUpdate,
+    );
+  }
+}

@@ -1,0 +1,140 @@
+{
+  "@@locale": "en",
+  "appName": "SchoolOS",
+  "dashboard": "Dashboard",
+  "students": "Students",
+  "attendance": "Attendance",
+  "fees": "Fees",
+  "exams": "Exams",
+  "results": "Results",
+  "messages": "Messages",
+  "library": "Library",
+  "transport": "Transport",
+  "hostel": "Hostel",
+  "canteen": "Canteen",
+  "more": "More",
+  "home": "Home",
+  "logout": "Logout",
+  "settings": "Settings",
+  "profile": "Profile",
+  "notifications": "Notifications",
+  "search": "Search",
+  "filter": "Filter",
+  "save": "Save",
+  "cancel": "Cancel",
+  "delete": "Delete",
+  "edit": "Edit",
+  "add": "Add",
+  "close": "Close",
+  "submit": "Submit",
+  "confirm": "Confirm",
+  "retry": "Try again",
+  "loading": "Loading...",
+  "noData": "No data found",
+  "error": "Something went wrong",
+  "success": "Success",
+  "present": "Present",
+  "absent": "Absent",
+  "late": "Late",
+  "totalStudents": "Total Students",
+  "totalTeachers": "Total Teachers",
+  "feesDue": "Fees Due",
+  "todayAttendance": "Today's Attendance",
+  "recentActivity": "Recent Activity",
+  "quickActions": "Quick Actions",
+  "viewAll": "View All",
+  "markAttendance": "Mark Attendance",
+  "collectFees": "Collect Fees",
+  "addStudent": "Add Student",
+  "sendNotice": "Send Notice",
+  "welcome": "Welcome back",
+  "goodMorning": "Good morning",
+  "goodAfternoon": "Good afternoon",
+  "goodEvening": "Good evening",
+  "admin": "Admin",
+  "teacher": "Teacher",
+  "student": "Student",
+  "parent": "Parent",
+  "className": "Class",
+  "section": "Section",
+  "subject": "Subject",
+  "marks": "Marks",
+  "grade": "Grade",
+  "percentage": "Percentage",
+  "rank": "Rank",
+  "pass": "Pass",
+  "fail": "Fail",
+  "payNow": "Pay Now",
+  "amountDue": "Amount Due",
+  "paidOn": "Paid On",
+  "dueDate": "Due Date",
+  "invoice": "Invoice",
+  "receipt": "Receipt",
+  "noticeBoard": "Notice Board",
+  "createNotice": "Create Notice",
+  "pinned": "Pinned",
+  "categories": "Categories",
+  "academic": "Academic",
+  "sports": "Sports",
+  "events": "Events",
+  "holiday": "Holiday",
+  "general": "General",
+  "emergency": "Emergency",
+  "portfolio": "Portfolio",
+  "achievements": "Achievements",
+  "digitalId": "Digital ID",
+  "language": "Language",
+  "theme": "Theme",
+  "darkMode": "Dark Mode",
+  "lightMode": "Light Mode",
+  "systemDefault": "System Default",
+
+  "aiBadgeSummary": "AI summary",
+  "@aiBadgeSummary": {
+    "description": "Chip label on AI-generated content blocks"
+  },
+  "aiBadgeCached": "AI · cached",
+  "@aiBadgeCached": {
+    "description": "Chip label when the AI output is reused from cache"
+  },
+  "aiBadgeTileMessage": "AI-generated — verify before acting on it.",
+  "@aiBadgeTileMessage": {
+    "description": "Banner shown above AI-generated content blocks"
+  },
+  "aiDisclosureTitle": "About this AI summary",
+  "@aiDisclosureTitle": {
+    "description": "Title of the AI content disclosure bottom sheet"
+  },
+  "aiDisclosureBuiltFrom": "Built from",
+  "@aiDisclosureBuiltFrom": {
+    "description": "Section header — the data sources used to produce the AI summary"
+  },
+  "aiDisclosureHowItWorks": "How it works",
+  "@aiDisclosureHowItWorks": {
+    "description": "Section header for the AI mechanism explanation"
+  },
+  "aiDisclosureHowItWorksBody": "A language model writes a short narrative from the data above. It can make small mistakes, mis-state numbers, or miss context.",
+  "@aiDisclosureHowItWorksBody": {
+    "description": "Body text explaining how the AI summary is produced"
+  },
+  "aiDisclosureFreshness": "Freshness",
+  "@aiDisclosureFreshness": {
+    "description": "Section header for the freshness disclosure"
+  },
+  "aiDisclosureFreshnessCached": "Reused from cache for speed and cost — the source numbers may be a few minutes stale.",
+  "@aiDisclosureFreshnessCached": {
+    "description": "Body shown when the AI output came from cache"
+  },
+  "aiDisclosureFreshnessLive": "Generated just now from the current data.",
+  "@aiDisclosureFreshnessLive": {
+    "description": "Body shown when the AI output is freshly generated"
+  },
+  "aiDisclosureUseItAs": "Use it as",
+  "@aiDisclosureUseItAs": {
+    "description": "Section header for guidance on how to use the AI summary"
+  },
+  "aiDisclosureUseItAsBody": "A starting point — not a substitute for reviewing the underlying student records yourself.",
+  "@aiDisclosureUseItAsBody": {
+    "description": "Body explaining that AI output supplements rather than replaces human review"
+  }
+}
