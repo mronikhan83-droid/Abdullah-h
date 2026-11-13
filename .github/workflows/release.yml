@@ -59,8 +59,8 @@ jobs:
       - name: Create .env (production secrets)
         run: |
           cat <<'EOF' > .env
-          SUPABASE_URL=${{ secrets.PROD_SUPABASE_URL }}
-          SUPABASE_ANON_KEY=${{ secrets.PROD_SUPABASE_ANON_KEY }}
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
           APP_ENV=production
           SHOW_DEMO_CREDENTIALS=false
           SUPER_ADMIN_EMAIL=${{ secrets.SUPER_ADMIN_EMAIL }}
