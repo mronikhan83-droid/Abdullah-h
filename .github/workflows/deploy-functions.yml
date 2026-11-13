@@ -19,5 +19,5 @@ jobs:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
         run: |
           for fn in create-user admin-reset-password compute-exam-stats ai-gateway health; do
-            supabase functions deploy "$fn" --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}" --use-api
+            supabase functions deploy "$fn" --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}" --use-api --yes
           done
