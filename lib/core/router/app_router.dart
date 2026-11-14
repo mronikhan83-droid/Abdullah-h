@@ -740,8 +740,20 @@ final appRouterProvider = Provider<GoRouter>((ref) {
         final role = currentUser?.primaryRole ?? sessionRole ?? '';
         final location = state.matchedLocation;
 
+        // Pages every role (including super_admin) may open: profile/account,
+        // settings and notifications. Without this the super_admin guard
+        // below bounced these taps straight back to the dashboard.
+        const superAdminSharedPaths = [
+          AppRoutes.account,
+          AppRoutes.settings,
+          AppRoutes.notifications,
+        ];
+        final isSharedRoute = superAdminSharedPaths
+            .any((p) => location == p || location.startsWith('$p/'));
+
         if (role == 'super_admin' &&
             !location.startsWith('/super-admin') &&
+            !isSharedRoute &&
             !isPublicRoute) {
           return AppRoutes.superAdminDashboard;
         }
